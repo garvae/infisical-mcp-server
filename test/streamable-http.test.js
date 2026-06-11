@@ -48,7 +48,7 @@ const waitForHealth = async (url, childProcess) => {
   throw lastError;
 };
 
-test("streamable HTTP transport initializes and exposes tools", async (t) => {
+const startHttpServer = async (t, envOverrides = {}) => {
   const port = await getFreePort();
   const childProcess = spawn(process.execPath, ["dist/index.js"], {
     cwd: repoRoot,
@@ -61,6 +61,7 @@ test("streamable HTTP transport initializes and exposes tools", async (t) => {
       MCP_HTTP_HOST: "127.0.0.1",
       MCP_HTTP_PORT: String(port),
       MCP_HTTP_PATH: "/mcp",
+      ...envOverrides,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -82,7 +83,16 @@ test("streamable HTTP transport initializes and exposes tools", async (t) => {
 
   await waitForHealth(`http://127.0.0.1:${port}/health`, childProcess);
 
-  const initializeResponse = await fetch(`http://127.0.0.1:${port}/mcp`, {
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    stderrChunks,
+  };
+};
+
+test("streamable HTTP transport initializes and exposes tools", async (t) => {
+  const { baseUrl, stderrChunks } = await startHttpServer(t);
+
+  const initializeResponse = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers: {
       accept: "application/json, text/event-stream",
@@ -115,7 +125,7 @@ test("streamable HTTP transport initializes and exposes tools", async (t) => {
   const initializePayload = await initializeResponse.json();
   assert.equal(initializePayload.result.serverInfo.name, "Infisical");
 
-  const listToolsResponse = await fetch(`http://127.0.0.1:${port}/mcp`, {
+  const listToolsResponse = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers: {
       accept: "application/json, text/event-stream",
@@ -140,4 +150,114 @@ test("streamable HTTP transport initializes and exposes tools", async (t) => {
   const toolNames = listToolsPayload.result.tools.map((tool) => tool.name);
   assert.ok(toolNames.includes("create-secret"));
   assert.ok(toolNames.includes("list-projects"));
+});
+
+test("streamable HTTP transport returns 400 for malformed JSON", async (t) => {
+  const { baseUrl } = await startHttpServer(t);
+
+  const response = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+    },
+    body: "{invalid-json",
+  });
+
+  assert.equal(response.status, 400);
+  const payload = await response.json();
+  assert.equal(payload.error.code, -32700);
+});
+
+test("streamable HTTP transport returns 413 for oversized bodies", async (t) => {
+  const { baseUrl } = await startHttpServer(t, {
+    MCP_HTTP_BODY_LIMIT_BYTES: "128",
+  });
+
+  const response = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: {
+          name: "test-client",
+          version: "1.0.0",
+        },
+        padding: "x".repeat(512),
+      },
+    }),
+  });
+
+  assert.equal(response.status, 413);
+  const payload = await response.json();
+  assert.equal(payload.error.code, -32000);
+});
+
+test("streamable HTTP transport reaps idle sessions", async (t) => {
+  const { baseUrl } = await startHttpServer(t, {
+    MCP_HTTP_SESSION_TTL_MS: "50",
+  });
+
+  const initializeResponse = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: {
+          name: "test-client",
+          version: "1.0.0",
+        },
+      },
+    }),
+  });
+
+  assert.equal(initializeResponse.status, 200);
+  const sessionId = initializeResponse.headers.get("mcp-session-id");
+  assert.ok(sessionId);
+
+  await delay(120);
+
+  const listToolsResponse = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+      "mcp-session-id": sessionId,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+      params: {},
+    }),
+  });
+
+  assert.equal(listToolsResponse.status, 404);
+});
+
+test("streamable HTTP transport advertises only supported methods", async (t) => {
+  const { baseUrl } = await startHttpServer(t);
+
+  const response = await fetch(`${baseUrl}/mcp`, {
+    method: "PATCH",
+  });
+
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get("allow"), "POST, DELETE");
 });
