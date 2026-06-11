@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 
 import { InfisicalSDK } from "@infisical/sdk";
+import { randomUUID } from "crypto";
 import fs from "fs";
 import axios from "axios";
+import {
+  createServer as createHttpServer,
+  IncomingMessage,
+  Server as HttpServer,
+  ServerResponse,
+} from "http";
 import path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
+  isInitializeRequest,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -15,6 +24,27 @@ import { z } from "zod";
 enum InfisicalAuthMethod {
   UniversalAuth = "universal-auth",
   TokenAuth = "access-token",
+}
+
+enum McpTransportMode {
+  Stdio = "stdio",
+  StreamableHttp = "streamable-http",
+}
+
+type StreamableSession = {
+  lastActivityAt: number;
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+};
+
+class HttpTransportError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly jsonRpcCode: number,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 const packageJson = JSON.parse(
@@ -35,6 +65,23 @@ const getEnvironmentVariables = () => {
         .min(1)
         .optional(),
       INFISICAL_HOST_URL: z.string().default("https://app.infisical.com"),
+      MCP_TRANSPORT: z
+        .nativeEnum(McpTransportMode)
+        .default(McpTransportMode.Stdio),
+      MCP_HTTP_HOST: z.string().default("127.0.0.1"),
+      MCP_HTTP_PORT: z.coerce.number().int().positive().default(3333),
+      MCP_HTTP_PATH: z
+        .string()
+        .trim()
+        .min(1)
+        .default("/mcp")
+        .transform((value) => (value.startsWith("/") ? value : `/${value}`)),
+      MCP_HTTP_BODY_LIMIT_BYTES: z.coerce
+        .number()
+        .int()
+        .positive()
+        .default(4 * 1024 * 1024),
+      MCP_HTTP_SESSION_TTL_MS: z.coerce.number().int().positive().default(300000),
     })
     // validate the env vars on startup to avoid runtime errors
     .superRefine((data, ctx) => {
@@ -82,6 +129,22 @@ const infisicalSdk = new InfisicalSDK({
   siteUrl: env.INFISICAL_HOST_URL,
 });
 
+const buildInfisicalApiBaseUrl = (hostUrl: string) => {
+  let normalizedHostUrl = hostUrl;
+  if (normalizedHostUrl.endsWith("/")) {
+    normalizedHostUrl = normalizedHostUrl.slice(0, -1);
+  }
+
+  if (!normalizedHostUrl.endsWith("/api")) {
+    normalizedHostUrl += "/api";
+  }
+
+  return normalizedHostUrl;
+};
+
+export const buildWorkspaceUrl = (hostUrl: string, type?: string) =>
+  `${buildInfisicalApiBaseUrl(hostUrl)}/v1/workspace${type && type !== "all" ? `?type=${type}` : ""}`;
+
 const handleAuthentication = async () => {
   if (isAuthenticated) {
     return;
@@ -106,18 +169,6 @@ const handleAuthentication = async () => {
   isAuthenticated = true;
 };
 
-const server = new Server(
-  {
-    name: "Infisical",
-    version: packageJson.version,
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
-);
-
 enum AvailableTools {
   CreateSecret = "create-secret",
   DeleteSecret = "delete-secret",
@@ -127,6 +178,7 @@ enum AvailableTools {
   CreateProject = "create-project",
   CreateEnvironment = "create-environment",
   CreateFolder = "create-folder",
+  ListFolders = "list-folders",
   InviteMembersToProject = "invite-members-to-project",
   ListProjects = "list-projects",
 }
@@ -138,6 +190,11 @@ const createSecretSchema = {
     secretName: z.string(),
     secretValue: z.string().optional(),
     secretPath: z.string().default("/"),
+    secretComment: z.string().optional(),
+    secretReminderNote: z.string().optional(),
+    secretReminderRepeatDays: z.number().optional(),
+    skipMultilineEncoding: z.boolean().optional(),
+    tagIds: z.array(z.string()).optional(),
   }),
   capability: {
     name: AvailableTools.CreateSecret,
@@ -166,6 +223,28 @@ const createSecretSchema = {
         secretPath: {
           type: "string",
           description: "The path of the secret to create (Defaults to /)",
+        },
+        secretComment: {
+          type: "string",
+          description:
+            "Optional comment or description to attach to the secret",
+        },
+        secretReminderNote: {
+          type: "string",
+          description: "Optional reminder note attached to the secret",
+        },
+        secretReminderRepeatDays: {
+          type: "number",
+          description: "Optional reminder repeat interval in days",
+        },
+        skipMultilineEncoding: {
+          type: "boolean",
+          description:
+            "Whether to skip multiline encoding for values containing newlines",
+        },
+        tagIds: {
+          ...stringArrayInputSchema,
+          description: "Optional tag IDs to attach to the secret",
         },
       },
       required: ["projectId", "environmentSlug", "secretName"],
@@ -218,6 +297,11 @@ const updateSecretSchema = {
     newSecretName: z.string().optional(),
     secretValue: z.string().optional(),
     secretPath: z.string().default("/"),
+    secretComment: z.string().optional(),
+    secretReminderNote: z.string().optional(),
+    secretReminderRepeatDays: z.number().optional(),
+    skipMultilineEncoding: z.boolean().optional(),
+    tagIds: z.array(z.string()).optional(),
   }),
   capability: {
     name: AvailableTools.UpdateSecret,
@@ -251,6 +335,28 @@ const updateSecretSchema = {
           type: "string",
           description: "The path of the secret to update (Defaults to /)",
         },
+        secretComment: {
+          type: "string",
+          description:
+            "Optional comment or description for the secret. If omitted, the existing comment is preserved.",
+        },
+        secretReminderNote: {
+          type: "string",
+          description: "Optional reminder note attached to the secret",
+        },
+        secretReminderRepeatDays: {
+          type: "number",
+          description: "Optional reminder repeat interval in days",
+        },
+        skipMultilineEncoding: {
+          type: "boolean",
+          description:
+            "Whether to skip multiline encoding for values containing newlines",
+        },
+        tagIds: {
+          ...stringArrayInputSchema,
+          description: "Optional tag IDs to attach to the secret",
+        },
       },
       required: ["projectId", "environmentSlug", "secretName"],
     },
@@ -264,6 +370,7 @@ const listSecretsSchema = {
     secretPath: z.string().default("/"),
     expandSecretReferences: z.boolean().default(true),
     includeImports: z.boolean().default(true),
+    recursive: z.boolean().default(false),
   }),
   capability: {
     name: AvailableTools.ListSecrets,
@@ -293,6 +400,11 @@ const listSecretsSchema = {
         includeImports: {
           type: "boolean",
           description: "Whether to include secret imports (Defaults to true)",
+        },
+        recursive: {
+          type: "boolean",
+          description:
+            "Whether to recursively list secrets from all sub-folders under the given path (Defaults to false)",
         },
       },
       required: ["projectId", "environmentSlug"],
@@ -472,6 +584,45 @@ const createFolderSchema = {
   },
 };
 
+const listFoldersSchema = {
+  zod: z.object({
+    projectId: z.string(),
+    environment: z.string(),
+    path: z.string().default("/"),
+    recursive: z.boolean().default(false),
+  }),
+  capability: {
+    name: AvailableTools.ListFolders,
+    description:
+      "List folders in a given Infisical project and environment",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: {
+          type: "string",
+          description:
+            "The ID of the project to list the folders from (required)",
+        },
+        environment: {
+          type: "string",
+          description:
+            "The environment slug to list the folders from (required)",
+        },
+        path: {
+          type: "string",
+          description: "The path to list folders from (Defaults to /)",
+        },
+        recursive: {
+          type: "boolean",
+          description:
+            "Whether to recursively list all sub-folders under the given path (Defaults to false)",
+        },
+      },
+      required: ["projectId", "environment"],
+    },
+  },
+};
+
 const listProjectsSchema = {
   zod: z.object({
     type: z
@@ -495,6 +646,11 @@ const listProjectsSchema = {
   },
 };
 
+const stringArrayInputSchema = {
+  type: "array",
+  items: { type: "string" },
+};
+
 const inviteMembersToProjectSchema = {
   zod: z.object({
     projectId: z.string(),
@@ -513,17 +669,17 @@ const inviteMembersToProjectSchema = {
           description: "The ID of the project to invite members to (required)",
         },
         emails: {
-          type: "array",
+          ...stringArrayInputSchema,
           description:
             "The emails of the members to invite. Either usernames or emails must be provided.",
         },
         usernames: {
-          type: "array",
+          ...stringArrayInputSchema,
           description:
             "The usernames of the members to invite. Either usernames or emails must be provided.",
         },
         roleSlugs: {
-          type: "array",
+          ...stringArrayInputSchema,
           description:
             "The role slugs of the members to invite. If not provided, the default role 'member' will be used. Ask the user to confirm the role they want to use if not explicitly specified.",
         },
@@ -532,7 +688,21 @@ const inviteMembersToProjectSchema = {
     },
   },
 };
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+
+const createMcpServer = () => {
+  const server = new Server(
+    {
+      name: "Infisical",
+      version: packageJson.version,
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       createSecretSchema.capability,
@@ -543,13 +713,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       createProjectSchema.capability,
       createEnvironmentSchema.capability,
       createFolderSchema.capability,
+      listFoldersSchema.capability,
       inviteMembersToProjectSchema.capability,
       listProjectsSchema.capability,
     ],
   };
-});
+  });
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     await handleAuthentication();
 
@@ -558,14 +729,40 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === AvailableTools.CreateSecret) {
       const data = createSecretSchema.zod.parse(args);
 
+      const createSecretOptions: Parameters<
+        ReturnType<typeof infisicalSdk.secrets>["createSecret"]
+      >[1] = {
+        environment: data.environmentSlug,
+        projectId: data.projectId,
+        secretPath: data.secretPath,
+        secretValue: data.secretValue ?? "",
+      };
+
+      if (data.secretComment !== undefined) {
+        createSecretOptions.secretComment = data.secretComment;
+      }
+
+      if (data.secretReminderNote !== undefined) {
+        createSecretOptions.secretReminderNote = data.secretReminderNote;
+      }
+
+      if (data.secretReminderRepeatDays !== undefined) {
+        createSecretOptions.secretReminderRepeatDays =
+          data.secretReminderRepeatDays;
+      }
+
+      if (data.skipMultilineEncoding !== undefined) {
+        createSecretOptions.skipMultilineEncoding =
+          data.skipMultilineEncoding;
+      }
+
+      if (data.tagIds !== undefined) {
+        createSecretOptions.tagIds = data.tagIds;
+      }
+
       const { secret } = await infisicalSdk
         .secrets()
-        .createSecret(data.secretName, {
-          environment: data.environmentSlug,
-          projectId: data.projectId,
-          secretPath: data.secretPath,
-          secretValue: data.secretValue ?? "",
-        });
+        .createSecret(data.secretName, createSecretOptions);
 
       return {
         content: [
@@ -601,14 +798,47 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === AvailableTools.UpdateSecret) {
       const data = updateSecretSchema.zod.parse(args);
 
+      const updateSecretOptions: Parameters<
+        ReturnType<typeof infisicalSdk.secrets>["updateSecret"]
+      >[1] = {
+        environment: data.environmentSlug,
+        projectId: data.projectId,
+        secretPath: data.secretPath,
+      };
+
+      if (data.secretValue !== undefined) {
+        updateSecretOptions.secretValue = data.secretValue;
+      }
+
+      if (data.newSecretName !== undefined) {
+        updateSecretOptions.newSecretName = data.newSecretName;
+      }
+
+      if (data.secretComment !== undefined) {
+        updateSecretOptions.secretComment = data.secretComment;
+      }
+
+      if (data.secretReminderNote !== undefined) {
+        updateSecretOptions.secretReminderNote = data.secretReminderNote;
+      }
+
+      if (data.secretReminderRepeatDays !== undefined) {
+        updateSecretOptions.secretReminderRepeatDays =
+          data.secretReminderRepeatDays;
+      }
+
+      if (data.skipMultilineEncoding !== undefined) {
+        updateSecretOptions.skipMultilineEncoding =
+          data.skipMultilineEncoding;
+      }
+
+      if (data.tagIds !== undefined) {
+        updateSecretOptions.tagIds = data.tagIds;
+      }
+
       const { secret } = await infisicalSdk
         .secrets()
-        .updateSecret(data.secretName, {
-          environment: data.environmentSlug,
-          projectId: data.projectId,
-          secretPath: data.secretPath,
-          secretValue: data.secretValue ?? "",
-        });
+        .updateSecret(data.secretName, updateSecretOptions);
 
       return {
         content: [
@@ -629,6 +859,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         secretPath: data.secretPath,
         expandSecretReferences: data.expandSecretReferences,
         includeImports: data.includeImports,
+        recursive: data.recursive,
       });
 
       const response = {
@@ -746,6 +977,34 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    if (name === AvailableTools.ListFolders) {
+      const data = listFoldersSchema.zod.parse(args);
+
+      const folders = await infisicalSdk.folders().listFolders({
+        environment: data.environment,
+        projectId: data.projectId,
+        path: data.path,
+        recursive: data.recursive,
+      });
+
+      const response = {
+        folders: folders.map((folder) => ({
+          id: folder.id,
+          name: folder.name,
+          parentId: folder.parentId,
+        })),
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${JSON.stringify(response)}`,
+          },
+        ],
+      };
+    }
+
     if (name === AvailableTools.InviteMembersToProject) {
       const data = inviteMembersToProjectSchema.zod.parse(args);
 
@@ -771,15 +1030,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const accessToken = infisicalSdk.auth().getAccessToken();
 
       try {
-        let hostUrl = env.INFISICAL_HOST_URL;
-        if (!hostUrl.endsWith("/api")) {
-          if (hostUrl.endsWith("/")) {
-            hostUrl = hostUrl.slice(0, -1);
-          }
-
-          hostUrl += "/api";
-        }
-
         const res = await axios.get<{
           workspaces: {
             hasDeleteProtection: boolean;
@@ -794,7 +1044,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               id: string;
             }[];
           }[];
-        }>(`${hostUrl}/v1/workspace?type=${data.type}`, {
+        }>(buildWorkspaceUrl(env.INFISICAL_HOST_URL, data.type), {
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
@@ -842,9 +1092,371 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     throw err;
   }
-});
+  });
 
-(async () => {
+  return server;
+};
+
+const readRequestBody = async (req: IncomingMessage) => {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  let bodyLimitExceeded = false;
+
+  for await (const chunk of req) {
+    const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += bufferChunk.byteLength;
+
+    if (totalBytes > env.MCP_HTTP_BODY_LIMIT_BYTES) {
+      bodyLimitExceeded = true;
+      req.resume();
+      break;
+    }
+
+    chunks.push(bufferChunk);
+  }
+
+  if (bodyLimitExceeded) {
+    throw new HttpTransportError(
+      413,
+      -32000,
+      `Request body exceeds ${env.MCP_HTTP_BODY_LIMIT_BYTES} bytes.`,
+    );
+  }
+
+  if (chunks.length === 0) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+  } catch {
+    throw new HttpTransportError(400, -32700, "Malformed JSON request body.");
+  }
+};
+
+const sendJson = (
+  res: ServerResponse,
+  statusCode: number,
+  body: Record<string, unknown>,
+) => {
+  const payload = JSON.stringify(body);
+  res.writeHead(statusCode, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+};
+
+const sendMethodNotAllowed = (res: ServerResponse) => {
+  res.writeHead(405, { allow: "POST, DELETE" });
+  res.end("Method Not Allowed");
+};
+
+const closeSession = async (
+  sessions: Map<string, StreamableSession>,
+  sessionId: string,
+) => {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return;
+  }
+
+  sessions.delete(sessionId);
+  await session.transport.close();
+  await session.server.close();
+};
+
+const touchSession = (session: StreamableSession) => {
+  session.lastActivityAt = Date.now();
+};
+
+const isSessionIdle = (session: StreamableSession) =>
+  Date.now() - session.lastActivityAt > env.MCP_HTTP_SESSION_TTL_MS;
+
+const getActiveSession = async (
+  sessions: Map<string, StreamableSession>,
+  sessionId: string,
+) => {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return undefined;
+  }
+
+  if (isSessionIdle(session)) {
+    await closeSession(sessions, sessionId);
+    return undefined;
+  }
+
+  touchSession(session);
+  return session;
+};
+
+const startStreamableHttpServer = async () => {
+  const sessions = new Map<string, StreamableSession>();
+  const sweepIntervalMs = Math.max(
+    1000,
+    Math.min(env.MCP_HTTP_SESSION_TTL_MS, 60000),
+  );
+
+  const sweepIdleSessions = async () => {
+    const activeSessionIds = [...sessions.keys()];
+
+    for (const sessionId of activeSessionIds) {
+      const session = sessions.get(sessionId);
+      if (!session || !isSessionIdle(session)) {
+        continue;
+      }
+
+      await closeSession(sessions, sessionId);
+    }
+  };
+
+  const sweepTimer = setInterval(() => {
+    void sweepIdleSessions().catch((error) => {
+      console.error("Failed to sweep idle MCP sessions", error);
+    });
+  }, sweepIntervalMs);
+  sweepTimer.unref();
+
+  const server = createHttpServer(async (req, res) => {
+    if (!req.url) {
+      sendJson(res, 400, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Bad Request: Missing request URL.",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    const requestUrl = new URL(req.url, "http://localhost");
+
+    if (requestUrl.pathname === "/health" && req.method === "GET") {
+      sendJson(res, 200, {
+        status: "ok",
+        transport: McpTransportMode.StreamableHttp,
+        path: env.MCP_HTTP_PATH,
+        version: packageJson.version,
+      });
+      return;
+    }
+
+    if (requestUrl.pathname !== env.MCP_HTTP_PATH) {
+      sendJson(res, 404, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Not Found.",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    try {
+      switch (req.method) {
+        case "POST": {
+          const requestBody = await readRequestBody(req);
+          const sessionId = req.headers["mcp-session-id"];
+          const normalizedSessionId =
+            typeof sessionId === "string" ? sessionId : undefined;
+
+          if (normalizedSessionId) {
+            const existingSession = await getActiveSession(
+              sessions,
+              normalizedSessionId,
+            );
+            if (!existingSession) {
+              sendJson(res, 404, {
+                jsonrpc: "2.0",
+                error: {
+                  code: -32000,
+                  message: "Session not found.",
+                },
+                id: null,
+              });
+              return;
+            }
+
+            await existingSession.transport.handleRequest(req, res, requestBody);
+            return;
+          }
+
+          if (!isInitializeRequest(requestBody)) {
+            sendJson(res, 400, {
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Bad Request: No valid session ID provided.",
+              },
+              id: null,
+            });
+            return;
+          }
+
+          const sessionServer = createMcpServer();
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            enableJsonResponse: true,
+            onsessioninitialized: (newSessionId) => {
+              sessions.set(newSessionId, {
+                lastActivityAt: Date.now(),
+                server: sessionServer,
+                transport,
+              });
+            },
+          });
+
+          transport.onclose = () => {
+            const transportSessionId = transport.sessionId;
+            if (transportSessionId) {
+              sessions.delete(transportSessionId);
+            }
+          };
+
+          await sessionServer.connect(transport);
+          await transport.handleRequest(req, res, requestBody);
+          return;
+        }
+        case "GET": {
+          sendMethodNotAllowed(res);
+          return;
+        }
+        case "DELETE": {
+          const sessionId = req.headers["mcp-session-id"];
+          const normalizedSessionId =
+            typeof sessionId === "string" ? sessionId : undefined;
+
+          if (!normalizedSessionId) {
+            sendJson(res, 404, {
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Session not found.",
+              },
+              id: null,
+            });
+            return;
+          }
+
+          const session = await getActiveSession(sessions, normalizedSessionId);
+          if (!session) {
+            sendJson(res, 404, {
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Session not found.",
+              },
+              id: null,
+            });
+            return;
+          }
+
+          await session.transport.handleRequest(req, res);
+          await closeSession(sessions, normalizedSessionId);
+          return;
+        }
+        default: {
+          sendMethodNotAllowed(res);
+          return;
+        }
+      }
+    } catch (error) {
+      if (error instanceof HttpTransportError) {
+        if (!res.headersSent) {
+          sendJson(res, error.statusCode, {
+            jsonrpc: "2.0",
+            error: {
+              code: error.jsonRpcCode,
+              message: error.message,
+            },
+            id: null,
+          });
+        }
+        return;
+      }
+
+      console.error("Failed to handle streamable HTTP request", error);
+      if (!res.headersSent) {
+        sendJson(res, 500, {
+          jsonrpc: "2.0",
+          error: {
+            code: -32603,
+            message: "Internal server error.",
+          },
+          id: null,
+        });
+      }
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(env.MCP_HTTP_PORT, env.MCP_HTTP_HOST, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  const closeAllSessions = async () => {
+    const activeSessionIds = [...sessions.keys()];
+    for (const sessionId of activeSessionIds) {
+      await closeSession(sessions, sessionId);
+    }
+  };
+
+  const shutdown = async () => {
+    clearInterval(sweepTimer);
+    await closeAllSessions();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    });
+  };
+
+  process.on("SIGINT", () => {
+    void shutdown().finally(() => process.exit(0));
+  });
+
+  process.on("SIGTERM", () => {
+    void shutdown().finally(() => process.exit(0));
+  });
+
+  console.error(
+    `Infisical MCP Server running on streamable HTTP at http://${env.MCP_HTTP_HOST}:${env.MCP_HTTP_PORT}${env.MCP_HTTP_PATH} ✅`,
+  );
+};
+
+const startStdioServer = async () => {
+  const server = createMcpServer();
   await server.connect(new StdioServerTransport());
   console.error("Infisical MCP Server running on stdio ✅");
-})();
+};
+
+const main = async () => {
+  switch (env.MCP_TRANSPORT) {
+    case McpTransportMode.Stdio:
+      await startStdioServer();
+      break;
+    case McpTransportMode.StreamableHttp:
+      await startStreamableHttpServer();
+      break;
+    default:
+      throw new Error(`Unsupported MCP transport: ${env.MCP_TRANSPORT}`);
+  }
+};
+
+if (require.main === module) {
+  void main().catch((error) => {
+    console.error("Failed to start Infisical MCP Server", error);
+    process.exit(1);
+  });
+}
