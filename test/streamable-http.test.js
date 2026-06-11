@@ -5,6 +5,10 @@ const path = require("node:path");
 const test = require("node:test");
 const { setTimeout: delay } = require("node:timers/promises");
 
+process.env.INFISICAL_AUTH_METHOD ??= "access-token";
+process.env.INFISICAL_TOKEN ??= "test-token";
+process.env.INFISICAL_HOST_URL ??= "https://app.infisical.com";
+
 const { buildWorkspaceUrl } = require("../dist/index.js");
 
 const repoRoot = path.resolve(__dirname, "..");
