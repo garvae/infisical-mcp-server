@@ -32,9 +32,20 @@ enum McpTransportMode {
 }
 
 type StreamableSession = {
+  lastActivityAt: number;
   server: Server;
   transport: StreamableHTTPServerTransport;
 };
+
+class HttpTransportError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly jsonRpcCode: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, "../package.json"), "utf-8"),
@@ -65,6 +76,12 @@ const getEnvironmentVariables = () => {
         .min(1)
         .default("/mcp")
         .transform((value) => (value.startsWith("/") ? value : `/${value}`)),
+      MCP_HTTP_BODY_LIMIT_BYTES: z.coerce
+        .number()
+        .int()
+        .positive()
+        .default(4 * 1024 * 1024),
+      MCP_HTTP_SESSION_TTL_MS: z.coerce.number().int().positive().default(300000),
     })
     // validate the env vars on startup to avoid runtime errors
     .superRefine((data, ctx) => {
@@ -1082,16 +1099,39 @@ const createMcpServer = () => {
 
 const readRequestBody = async (req: IncomingMessage) => {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  let bodyLimitExceeded = false;
 
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += bufferChunk.byteLength;
+
+    if (totalBytes > env.MCP_HTTP_BODY_LIMIT_BYTES) {
+      bodyLimitExceeded = true;
+      req.resume();
+      break;
+    }
+
+    chunks.push(bufferChunk);
+  }
+
+  if (bodyLimitExceeded) {
+    throw new HttpTransportError(
+      413,
+      -32000,
+      `Request body exceeds ${env.MCP_HTTP_BODY_LIMIT_BYTES} bytes.`,
+    );
   }
 
   if (chunks.length === 0) {
     return undefined;
   }
 
-  return JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+  } catch {
+    throw new HttpTransportError(400, -32700, "Malformed JSON request body.");
+  }
 };
 
 const sendJson = (
@@ -1105,6 +1145,11 @@ const sendJson = (
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
+};
+
+const sendMethodNotAllowed = (res: ServerResponse) => {
+  res.writeHead(405, { allow: "POST, DELETE" });
+  res.end("Method Not Allowed");
 };
 
 const closeSession = async (
@@ -1121,8 +1166,57 @@ const closeSession = async (
   await session.server.close();
 };
 
+const touchSession = (session: StreamableSession) => {
+  session.lastActivityAt = Date.now();
+};
+
+const isSessionIdle = (session: StreamableSession) =>
+  Date.now() - session.lastActivityAt > env.MCP_HTTP_SESSION_TTL_MS;
+
+const getActiveSession = async (
+  sessions: Map<string, StreamableSession>,
+  sessionId: string,
+) => {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return undefined;
+  }
+
+  if (isSessionIdle(session)) {
+    await closeSession(sessions, sessionId);
+    return undefined;
+  }
+
+  touchSession(session);
+  return session;
+};
+
 const startStreamableHttpServer = async () => {
   const sessions = new Map<string, StreamableSession>();
+  const sweepIntervalMs = Math.max(
+    1000,
+    Math.min(env.MCP_HTTP_SESSION_TTL_MS, 60000),
+  );
+
+  const sweepIdleSessions = async () => {
+    const activeSessionIds = [...sessions.keys()];
+
+    for (const sessionId of activeSessionIds) {
+      const session = sessions.get(sessionId);
+      if (!session || !isSessionIdle(session)) {
+        continue;
+      }
+
+      await closeSession(sessions, sessionId);
+    }
+  };
+
+  const sweepTimer = setInterval(() => {
+    void sweepIdleSessions().catch((error) => {
+      console.error("Failed to sweep idle MCP sessions", error);
+    });
+  }, sweepIntervalMs);
+  sweepTimer.unref();
 
   const server = createHttpServer(async (req, res) => {
     if (!req.url) {
@@ -1170,7 +1264,10 @@ const startStreamableHttpServer = async () => {
             typeof sessionId === "string" ? sessionId : undefined;
 
           if (normalizedSessionId) {
-            const existingSession = sessions.get(normalizedSessionId);
+            const existingSession = await getActiveSession(
+              sessions,
+              normalizedSessionId,
+            );
             if (!existingSession) {
               sendJson(res, 404, {
                 jsonrpc: "2.0",
@@ -1205,6 +1302,7 @@ const startStreamableHttpServer = async () => {
             enableJsonResponse: true,
             onsessioninitialized: (newSessionId) => {
               sessions.set(newSessionId, {
+                lastActivityAt: Date.now(),
                 server: sessionServer,
                 transport,
               });
@@ -1223,8 +1321,7 @@ const startStreamableHttpServer = async () => {
           return;
         }
         case "GET": {
-          res.writeHead(405, { allow: "POST, DELETE" });
-          res.end("Method Not Allowed");
+          sendMethodNotAllowed(res);
           return;
         }
         case "DELETE": {
@@ -1232,7 +1329,7 @@ const startStreamableHttpServer = async () => {
           const normalizedSessionId =
             typeof sessionId === "string" ? sessionId : undefined;
 
-          if (!normalizedSessionId || !sessions.has(normalizedSessionId)) {
+          if (!normalizedSessionId) {
             sendJson(res, 404, {
               jsonrpc: "2.0",
               error: {
@@ -1244,18 +1341,43 @@ const startStreamableHttpServer = async () => {
             return;
           }
 
-          const session = sessions.get(normalizedSessionId)!;
+          const session = await getActiveSession(sessions, normalizedSessionId);
+          if (!session) {
+            sendJson(res, 404, {
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Session not found.",
+              },
+              id: null,
+            });
+            return;
+          }
+
           await session.transport.handleRequest(req, res);
           await closeSession(sessions, normalizedSessionId);
           return;
         }
         default: {
-          res.writeHead(405, { allow: "GET, POST, DELETE" });
-          res.end("Method Not Allowed");
+          sendMethodNotAllowed(res);
           return;
         }
       }
     } catch (error) {
+      if (error instanceof HttpTransportError) {
+        if (!res.headersSent) {
+          sendJson(res, error.statusCode, {
+            jsonrpc: "2.0",
+            error: {
+              code: error.jsonRpcCode,
+              message: error.message,
+            },
+            id: null,
+          });
+        }
+        return;
+      }
+
       console.error("Failed to handle streamable HTTP request", error);
       if (!res.headersSent) {
         sendJson(res, 500, {
@@ -1286,6 +1408,7 @@ const startStreamableHttpServer = async () => {
   };
 
   const shutdown = async () => {
+    clearInterval(sweepTimer);
     await closeAllSessions();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => {

@@ -32,6 +32,8 @@ In order to use the MCP server, you must first set the environment variables req
 - `MCP_HTTP_HOST`: Host interface for `streamable-http` mode. Defaults to `127.0.0.1`.
 - `MCP_HTTP_PORT`: Port for `streamable-http` mode. Defaults to `3333`.
 - `MCP_HTTP_PATH`: HTTP path for `streamable-http` mode. Defaults to `/mcp`.
+- `MCP_HTTP_BODY_LIMIT_BYTES`: Maximum accepted HTTP request body size in `streamable-http` mode. Defaults to `4194304` (4 MiB).
+- `MCP_HTTP_SESSION_TTL_MS`: Idle session TTL in `streamable-http` mode. Defaults to `300000` (5 minutes).
 
 To run the Infisical MCP server using npx, use the following command:
 
@@ -54,6 +56,7 @@ The fork exposes:
 
 This implementation uses the official `StreamableHTTPServerTransport` from
 `@modelcontextprotocol/sdk` and keeps stdio as the default for compatibility.
+Idle HTTP sessions are automatically reaped after the configured TTL.
 
 ### Usage with Claude Desktop
 
