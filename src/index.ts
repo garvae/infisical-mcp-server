@@ -127,6 +127,7 @@ enum AvailableTools {
   CreateProject = "create-project",
   CreateEnvironment = "create-environment",
   CreateFolder = "create-folder",
+  ListFolders = "list-folders",
   InviteMembersToProject = "invite-members-to-project",
   ListProjects = "list-projects",
 }
@@ -138,6 +139,11 @@ const createSecretSchema = {
     secretName: z.string(),
     secretValue: z.string().optional(),
     secretPath: z.string().default("/"),
+    secretComment: z.string().optional(),
+    secretReminderNote: z.string().optional(),
+    secretReminderRepeatDays: z.number().optional(),
+    skipMultilineEncoding: z.boolean().optional(),
+    tagIds: z.array(z.string()).optional(),
   }),
   capability: {
     name: AvailableTools.CreateSecret,
@@ -166,6 +172,28 @@ const createSecretSchema = {
         secretPath: {
           type: "string",
           description: "The path of the secret to create (Defaults to /)",
+        },
+        secretComment: {
+          type: "string",
+          description:
+            "Optional comment or description to attach to the secret",
+        },
+        secretReminderNote: {
+          type: "string",
+          description: "Optional reminder note attached to the secret",
+        },
+        secretReminderRepeatDays: {
+          type: "number",
+          description: "Optional reminder repeat interval in days",
+        },
+        skipMultilineEncoding: {
+          type: "boolean",
+          description:
+            "Whether to skip multiline encoding for values containing newlines",
+        },
+        tagIds: {
+          ...stringArrayInputSchema,
+          description: "Optional tag IDs to attach to the secret",
         },
       },
       required: ["projectId", "environmentSlug", "secretName"],
@@ -218,6 +246,11 @@ const updateSecretSchema = {
     newSecretName: z.string().optional(),
     secretValue: z.string().optional(),
     secretPath: z.string().default("/"),
+    secretComment: z.string().optional(),
+    secretReminderNote: z.string().optional(),
+    secretReminderRepeatDays: z.number().optional(),
+    skipMultilineEncoding: z.boolean().optional(),
+    tagIds: z.array(z.string()).optional(),
   }),
   capability: {
     name: AvailableTools.UpdateSecret,
@@ -251,6 +284,28 @@ const updateSecretSchema = {
           type: "string",
           description: "The path of the secret to update (Defaults to /)",
         },
+        secretComment: {
+          type: "string",
+          description:
+            "Optional comment or description for the secret. If omitted, the existing comment is preserved.",
+        },
+        secretReminderNote: {
+          type: "string",
+          description: "Optional reminder note attached to the secret",
+        },
+        secretReminderRepeatDays: {
+          type: "number",
+          description: "Optional reminder repeat interval in days",
+        },
+        skipMultilineEncoding: {
+          type: "boolean",
+          description:
+            "Whether to skip multiline encoding for values containing newlines",
+        },
+        tagIds: {
+          ...stringArrayInputSchema,
+          description: "Optional tag IDs to attach to the secret",
+        },
       },
       required: ["projectId", "environmentSlug", "secretName"],
     },
@@ -264,6 +319,7 @@ const listSecretsSchema = {
     secretPath: z.string().default("/"),
     expandSecretReferences: z.boolean().default(true),
     includeImports: z.boolean().default(true),
+    recursive: z.boolean().default(false),
   }),
   capability: {
     name: AvailableTools.ListSecrets,
@@ -293,6 +349,11 @@ const listSecretsSchema = {
         includeImports: {
           type: "boolean",
           description: "Whether to include secret imports (Defaults to true)",
+        },
+        recursive: {
+          type: "boolean",
+          description:
+            "Whether to recursively list secrets from all sub-folders under the given path (Defaults to false)",
         },
       },
       required: ["projectId", "environmentSlug"],
@@ -472,6 +533,45 @@ const createFolderSchema = {
   },
 };
 
+const listFoldersSchema = {
+  zod: z.object({
+    projectId: z.string(),
+    environment: z.string(),
+    path: z.string().default("/"),
+    recursive: z.boolean().default(false),
+  }),
+  capability: {
+    name: AvailableTools.ListFolders,
+    description:
+      "List folders in a given Infisical project and environment",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: {
+          type: "string",
+          description:
+            "The ID of the project to list the folders from (required)",
+        },
+        environment: {
+          type: "string",
+          description:
+            "The environment slug to list the folders from (required)",
+        },
+        path: {
+          type: "string",
+          description: "The path to list folders from (Defaults to /)",
+        },
+        recursive: {
+          type: "boolean",
+          description:
+            "Whether to recursively list all sub-folders under the given path (Defaults to false)",
+        },
+      },
+      required: ["projectId", "environment"],
+    },
+  },
+};
+
 const listProjectsSchema = {
   zod: z.object({
     type: z
@@ -495,6 +595,11 @@ const listProjectsSchema = {
   },
 };
 
+const stringArrayInputSchema = {
+  type: "array",
+  items: { type: "string" },
+};
+
 const inviteMembersToProjectSchema = {
   zod: z.object({
     projectId: z.string(),
@@ -513,17 +618,17 @@ const inviteMembersToProjectSchema = {
           description: "The ID of the project to invite members to (required)",
         },
         emails: {
-          type: "array",
+          ...stringArrayInputSchema,
           description:
             "The emails of the members to invite. Either usernames or emails must be provided.",
         },
         usernames: {
-          type: "array",
+          ...stringArrayInputSchema,
           description:
             "The usernames of the members to invite. Either usernames or emails must be provided.",
         },
         roleSlugs: {
-          type: "array",
+          ...stringArrayInputSchema,
           description:
             "The role slugs of the members to invite. If not provided, the default role 'member' will be used. Ask the user to confirm the role they want to use if not explicitly specified.",
         },
@@ -543,6 +648,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       createProjectSchema.capability,
       createEnvironmentSchema.capability,
       createFolderSchema.capability,
+      listFoldersSchema.capability,
       inviteMembersToProjectSchema.capability,
       listProjectsSchema.capability,
     ],
@@ -558,14 +664,40 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === AvailableTools.CreateSecret) {
       const data = createSecretSchema.zod.parse(args);
 
+      const createSecretOptions: Parameters<
+        ReturnType<typeof infisicalSdk.secrets>["createSecret"]
+      >[1] = {
+        environment: data.environmentSlug,
+        projectId: data.projectId,
+        secretPath: data.secretPath,
+        secretValue: data.secretValue ?? "",
+      };
+
+      if (data.secretComment !== undefined) {
+        createSecretOptions.secretComment = data.secretComment;
+      }
+
+      if (data.secretReminderNote !== undefined) {
+        createSecretOptions.secretReminderNote = data.secretReminderNote;
+      }
+
+      if (data.secretReminderRepeatDays !== undefined) {
+        createSecretOptions.secretReminderRepeatDays =
+          data.secretReminderRepeatDays;
+      }
+
+      if (data.skipMultilineEncoding !== undefined) {
+        createSecretOptions.skipMultilineEncoding =
+          data.skipMultilineEncoding;
+      }
+
+      if (data.tagIds !== undefined) {
+        createSecretOptions.tagIds = data.tagIds;
+      }
+
       const { secret } = await infisicalSdk
         .secrets()
-        .createSecret(data.secretName, {
-          environment: data.environmentSlug,
-          projectId: data.projectId,
-          secretPath: data.secretPath,
-          secretValue: data.secretValue ?? "",
-        });
+        .createSecret(data.secretName, createSecretOptions);
 
       return {
         content: [
@@ -601,14 +733,47 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === AvailableTools.UpdateSecret) {
       const data = updateSecretSchema.zod.parse(args);
 
+      const updateSecretOptions: Parameters<
+        ReturnType<typeof infisicalSdk.secrets>["updateSecret"]
+      >[1] = {
+        environment: data.environmentSlug,
+        projectId: data.projectId,
+        secretPath: data.secretPath,
+      };
+
+      if (data.secretValue !== undefined) {
+        updateSecretOptions.secretValue = data.secretValue;
+      }
+
+      if (data.newSecretName !== undefined) {
+        updateSecretOptions.newSecretName = data.newSecretName;
+      }
+
+      if (data.secretComment !== undefined) {
+        updateSecretOptions.secretComment = data.secretComment;
+      }
+
+      if (data.secretReminderNote !== undefined) {
+        updateSecretOptions.secretReminderNote = data.secretReminderNote;
+      }
+
+      if (data.secretReminderRepeatDays !== undefined) {
+        updateSecretOptions.secretReminderRepeatDays =
+          data.secretReminderRepeatDays;
+      }
+
+      if (data.skipMultilineEncoding !== undefined) {
+        updateSecretOptions.skipMultilineEncoding =
+          data.skipMultilineEncoding;
+      }
+
+      if (data.tagIds !== undefined) {
+        updateSecretOptions.tagIds = data.tagIds;
+      }
+
       const { secret } = await infisicalSdk
         .secrets()
-        .updateSecret(data.secretName, {
-          environment: data.environmentSlug,
-          projectId: data.projectId,
-          secretPath: data.secretPath,
-          secretValue: data.secretValue ?? "",
-        });
+        .updateSecret(data.secretName, updateSecretOptions);
 
       return {
         content: [
@@ -629,6 +794,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         secretPath: data.secretPath,
         expandSecretReferences: data.expandSecretReferences,
         includeImports: data.includeImports,
+        recursive: data.recursive,
       });
 
       const response = {
@@ -746,6 +912,34 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    if (name === AvailableTools.ListFolders) {
+      const data = listFoldersSchema.zod.parse(args);
+
+      const folders = await infisicalSdk.folders().listFolders({
+        environment: data.environment,
+        projectId: data.projectId,
+        path: data.path,
+        recursive: data.recursive,
+      });
+
+      const response = {
+        folders: folders.map((folder) => ({
+          id: folder.id,
+          name: folder.name,
+          parentId: folder.parentId,
+        })),
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${JSON.stringify(response)}`,
+          },
+        ],
+      };
+    }
+
     if (name === AvailableTools.InviteMembersToProject) {
       const data = inviteMembersToProjectSchema.zod.parse(args);
 
@@ -794,7 +988,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               id: string;
             }[];
           }[];
-        }>(`${hostUrl}/v1/workspace?type=${data.type}`, {
+        }>(`${hostUrl}/v1/workspace${data.type && data.type !== "all" ? `?type=${data.type}` : ""}`, {
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
