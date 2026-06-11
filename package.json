@@ -27,7 +27,8 @@
   "license": "Apache-2.0",
   "scripts": {
     "build": "tsup src/index.ts --out-dir dist --format cjs --tsconfig tsconfig.json --no-splitting",
-    "test": "npm run build && node --test"
+    "test": "npm run build && npm run test:runtime",
+    "test:runtime": "node --test"
   },
 
   "overrides": {

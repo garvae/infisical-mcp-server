@@ -58,6 +58,43 @@ This implementation uses the official `StreamableHTTPServerTransport` from
 `@modelcontextprotocol/sdk` and keeps stdio as the default for compatibility.
 Idle HTTP sessions are automatically reaped after the configured TTL.
 
+### Docker runtime
+
+To build the fork as a deployable container image locally:
+
+```bash
+docker build \
+  --build-arg VCS_REF=$(git rev-parse HEAD) \
+  --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+  -t ghcr.io/<owner>/infisical-mcp-server:dev .
+```
+
+Run the image with the required Infisical credentials:
+
+```bash
+docker run --rm \
+  -p 3333:3333 \
+  -e INFISICAL_AUTH_METHOD=access-token \
+  -e INFISICAL_TOKEN=<token> \
+  ghcr.io/<owner>/infisical-mcp-server:dev
+```
+
+The `/health` response includes the package version together with deployment
+metadata (`revision` and `buildTimestamp`) so CI and MCPHub-side probes can
+verify which image is currently serving traffic.
+
+### Automated build and deploy workflows
+
+This fork now includes:
+
+- `Validate Fork Changes`: PR and branch CI for `npm ci`, build, and tests
+- `Build and Push Container Image`: publish a runtime image to `ghcr.io`
+- `Deploy MCP Runtime`: update a server-side Docker Compose stack over SSH
+
+The deploy workflow expects a server-side compose directory based on
+[deploy/README.md](deploy/README.md). The intended MCPHub integration path is an
+internal `streamable-http` URL such as `http://infisical-mcp-http:3333/mcp`.
+
 ### Usage with Claude Desktop
 
 Add the following to your `claude_desktop_config.json`. See [here](https://modelcontextprotocol.io/quickstart/user) for more details.

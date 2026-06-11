@@ -165,6 +165,24 @@ test("streamable HTTP transport initializes and exposes tools", async (t) => {
   assert.ok(toolNames.includes("list-projects"));
 });
 
+test("health endpoint exposes deployment metadata", async (t) => {
+  const { baseUrl } = await startHttpServer(t, {
+    MCP_BUILD_REVISION: "sha-test",
+    MCP_BUILD_TIMESTAMP: "2026-06-11T12:00:00Z",
+  });
+
+  const response = await fetch(`${baseUrl}/health`);
+  assert.equal(response.status, 200);
+
+  const payload = await response.json();
+  assert.equal(payload.status, "ok");
+  assert.equal(payload.name, "infisical-mcp-server");
+  assert.equal(payload.transport, "streamable-http");
+  assert.equal(payload.path, "/mcp");
+  assert.equal(payload.revision, "sha-test");
+  assert.equal(payload.buildTimestamp, "2026-06-11T12:00:00Z");
+});
+
 test("streamable HTTP transport returns 400 for malformed JSON", async (t) => {
   const { baseUrl } = await startHttpServer(t);
 

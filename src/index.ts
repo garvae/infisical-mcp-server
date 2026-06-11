@@ -51,6 +51,11 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, "../package.json"), "utf-8"),
 ) as { version: string };
 
+const getBuildMetadata = () => ({
+  revision: process.env.MCP_BUILD_REVISION?.trim() || "unknown",
+  timestamp: process.env.MCP_BUILD_TIMESTAMP?.trim() || "unknown",
+});
+
 const getEnvironmentVariables = () => {
   const envSchema = z
     .object({
@@ -1234,11 +1239,15 @@ const startStreamableHttpServer = async () => {
     const requestUrl = new URL(req.url, "http://localhost");
 
     if (requestUrl.pathname === "/health" && req.method === "GET") {
+      const buildMetadata = getBuildMetadata();
       sendJson(res, 200, {
         status: "ok",
+        name: "infisical-mcp-server",
         transport: McpTransportMode.StreamableHttp,
         path: env.MCP_HTTP_PATH,
         version: packageJson.version,
+        revision: buildMetadata.revision,
+        buildTimestamp: buildMetadata.timestamp,
       });
       return;
     }

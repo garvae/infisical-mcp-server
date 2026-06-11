@@ -14,6 +14,7 @@ permissions:
 jobs:
     npm:
         name: Publish NPM
+        if: github.repository == 'Infisical/infisical-mcp-server'
         runs-on: ubuntu-22.04
         steps:
             - name: Checkout repo
