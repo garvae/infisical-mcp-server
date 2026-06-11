@@ -1,4 +1,19 @@
+# Unofficial Infisical MCP Fork
+
+> [!WARNING]
+> This repository is an unofficial fork of the original
+> [Infisical MCP Server](https://github.com/Infisical/infisical-mcp-server).
+> It exists to carry fixes and transport improvements that are not yet available
+> upstream. Upstream updates may land later or differ from the changes in this
+> fork.
+>
+> Use this fork at your own risk. It is provided without guarantees or liability
+> from the fork maintainer. See [LICENSE](LICENSE) for the applicable
+> `Apache-2.0` license terms.
+
 # Infisical Model Context Protocol
+
+Upstream repository: <https://github.com/Infisical/infisical-mcp-server>
 
 The Infisical [Model Context Protocol](https://modelcontextprotocol.io/) server allows you to integrate with Infisical APIs through function calling. This protocol supports various tools to interact with Infisical.
 
