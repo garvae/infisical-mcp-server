@@ -14,15 +14,40 @@ on:
 jobs:
   deploy:
     name: Deploy to Server
-    if: ${{ secrets.DEPLOY_SSH_HOST != '' && secrets.DEPLOY_SSH_USER != '' && secrets.DEPLOY_SSH_KEY != '' && secrets.DEPLOY_PATH != '' && secrets.GHCR_USERNAME != '' && secrets.GHCR_PULL_TOKEN != '' }}
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check deploy secrets
+        id: preflight
+        shell: bash
+        env:
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          if [ -n "$DEPLOY_SSH_HOST" ] && \
+             [ -n "$DEPLOY_SSH_USER" ] && \
+             [ -n "$DEPLOY_SSH_KEY" ] && \
+             [ -n "$DEPLOY_PATH" ] && \
+             [ -n "$GHCR_USERNAME" ] && \
+             [ -n "$GHCR_PULL_TOKEN" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "deploy_port=${DEPLOY_SSH_PORT:-22}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "deploy_port=22" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve image tag
         id: image
+        if: ${{ steps.preflight.outputs.ready == 'true' }}
         shell: bash
         run: |
           if [ -n "${{ github.event.inputs.image_tag }}" ]; then
@@ -32,10 +57,11 @@ jobs:
           fi
 
       - name: Upload compose definition
+        if: ${{ steps.preflight.outputs.ready == 'true' }}
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.DEPLOY_SSH_HOST }}
-          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          port: ${{ steps.preflight.outputs.deploy_port }}
           username: ${{ secrets.DEPLOY_SSH_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           source: deploy/docker-compose.yml
@@ -43,10 +69,11 @@ jobs:
           strip_components: 1
 
       - name: Deploy compose stack
+        if: ${{ steps.preflight.outputs.ready == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_SSH_HOST }}
-          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          port: ${{ steps.preflight.outputs.deploy_port }}
           username: ${{ secrets.DEPLOY_SSH_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script_stop: true
@@ -60,3 +87,7 @@ jobs:
             docker compose pull infisical-mcp-http
             docker compose up -d infisical-mcp-http
             curl --fail --silent --show-error http://127.0.0.1:${MCP_HTTP_PORT:-3333}/health
+
+      - name: Skip deploy when secrets are not configured
+        if: ${{ steps.preflight.outputs.ready != 'true' }}
+        run: echo "Deploy secrets are not configured yet. Skipping server deploy."
